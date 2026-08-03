@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-extract_cluster.py — Step 1 of IntelliAide pure-skills pipeline.
+extract_cluster.py — Step 1 of IntelliAide pure-skills pipeline (LLM-free).
 
-Reads diagnostic data from /data/input (mounted from a PVC specified in the
-Proposal's spec.dataSource.claimName) and validates it.
+Reads diagnostic data from a specified directory (default: /data/input) and
+validates it. The data directory can be overridden via --data-dir to point to
+wherever the must-gather output was collected (e.g. /tmp/must-gather-output
+when the agent runs `oc adm must-gather` inside the sandbox).
 
-The PVC mount point is /data/input; cluster_dir in state.json is the deepest
-directory that serves as the logical root for downstream file resolution.
-Single-child wrapper directories are unwrapped so cluster_dir lands as close
-to the real data as possible.  No assumptions are made about the internal
-layout — downstream DataAnalyzer._resolve_path handles path expansion with
-glob wildcards for any directory structure.
-
-The PVC must be pre-populated with diagnostic data before the Proposal is
-created. The operator mounts it read-only at /data/input.
+The cluster_dir in state.json is the deepest directory that serves as the
+logical root for downstream file resolution. Single-child wrapper directories
+are unwrapped so cluster_dir lands as close to the real data as possible.
+No assumptions are made about the internal layout — downstream
+DataAnalyzer._resolve_path handles path expansion with glob wildcards for
+any directory structure.
 
 Usage:
+    # With default data directory (/data/input):
     python /app/skills/intelliaide/extract_cluster.py --query "etcd pods not ready"
+
+    # With custom data directory (e.g. after oc adm must-gather):
+    python /app/skills/intelliaide/extract_cluster.py --query "etcd pods not ready" \\
+        --data-dir /tmp/must-gather-output
 
     # Reuse an existing job dir (skips validation)
     python /app/skills/intelliaide/extract_cluster.py --query "..." --job-dir /tmp/intelliaide/abc123
@@ -25,7 +29,7 @@ Output (stdout JSON):
     {
       "job_id":      "<8-char id>",
       "job_dir":     "/tmp/intelliaide/<job_id>",
-      "cluster_dir": "/data/input/...",
+      "cluster_dir": "<data-dir>/...",
       "mode":        "must-gather",
       "success":     true,
       "return_code": 0
@@ -42,9 +46,29 @@ import uuid
 from pathlib import Path
 
 _SKILL_DIR = Path(__file__).resolve().parent
+for _p in (str(_SKILL_DIR),):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 _JOB_BASE  = "/tmp/intelliaide"
 
-_DATA_INPUT_DIR = Path("/data/input")
+_DEFAULT_DATA_DIR = "/data/input"
+
+
+def _mcp_configured() -> bool:
+    """Return True when an MCP server is available to fetch data on demand.
+
+    In MCP mode the data directory legitimately starts out empty/near-empty
+    — files are fetched lazily by analyze_data.py's adapter in Step 3, not
+    pre-populated on the PVC/filesystem. The local-file-count validation
+    below only makes sense for the non-MCP (locally mounted must-gather)
+    path, so it must be skipped here.
+    """
+    try:
+        from mcp_adapter.mcp_client import get_mcp_url
+        return bool(get_mcp_url())
+    except Exception:
+        return False
 
 
 def _log_pod(msg: str) -> None:
@@ -112,8 +136,8 @@ def _total_files(entries: "list[Path]") -> int:
     return total
 
 
-def _check_data_source() -> "tuple[Path, bool, str]":
-    """Validate /data/input and return the data root for downstream resolution.
+def _check_data_source(data_input_dir: Path) -> "tuple[Path, bool, str]":
+    """Validate the data input directory and return the data root for downstream resolution.
 
     Checks: mount exists, is readable, is non-empty, has enough files.
     Then unwraps single-child wrapper directories so cluster_dir is as close
@@ -121,36 +145,47 @@ def _check_data_source() -> "tuple[Path, bool, str]":
 
     Returns (cluster_dir, success, error_message).
     """
-    if not _DATA_INPUT_DIR.exists():
-        return _DATA_INPUT_DIR, False, (
-            "No data source found at /data/input. "
-            "Ensure spec.dataSource.claimName is set on the Proposal "
-            "and the PVC contains diagnostic data."
+    mcp_mode = _mcp_configured()
+
+    # In MCP mode, the cache directory is expected to start out empty (or
+    # only contain a handful of previously-fetched files) — data is pulled
+    # on demand in Step 3. Skip the pre-population checks below entirely
+    # and use the data dir itself as cluster_dir, so a near-empty directory
+    # doesn't get mistaken for a "single-child wrapper" and doesn't need to
+    # be artificially seeded just to pass validation here.
+    if mcp_mode:
+        data_input_dir.mkdir(parents=True, exist_ok=True)
+        return data_input_dir, True, ""
+
+    if not data_input_dir.exists():
+        return data_input_dir, False, (
+            f"No data source found at {data_input_dir}. "
+            "Ensure the data directory exists and contains diagnostic data."
         )
 
     try:
-        list(_DATA_INPUT_DIR.iterdir())
+        list(data_input_dir.iterdir())
     except OSError as exc:
-        return _DATA_INPUT_DIR, False, (
-            f"Cannot read /data/input: {exc}. "
-            "Check PVC permissions and content."
+        return data_input_dir, False, (
+            f"Cannot read {data_input_dir}: {exc}. "
+            "Check directory permissions and content."
         )
 
-    real = _real_entries(_DATA_INPUT_DIR)
+    real = _real_entries(data_input_dir)
     if not real:
-        return _DATA_INPUT_DIR, False, (
-            "Data source at /data/input is empty (only lost+found). "
-            "Ensure the PVC contains diagnostic data before creating the Proposal."
+        return data_input_dir, False, (
+            f"Data source at {data_input_dir} is empty (only lost+found). "
+            "Ensure the directory contains diagnostic data."
         )
 
     total_files = _total_files(real)
     if total_files < _MIN_DATA_FILES:
-        return _DATA_INPUT_DIR, False, (
-            f"Data source at /data/input has too few files ({total_files}). "
-            "Ensure the PVC contains a complete diagnostic bundle."
+        return data_input_dir, False, (
+            f"Data source at {data_input_dir} has too few files ({total_files}). "
+            "Ensure the directory contains a complete diagnostic bundle."
         )
 
-    data_root = _unwrap_single_child_dirs(_DATA_INPUT_DIR)
+    data_root = _unwrap_single_child_dirs(data_input_dir)
     return data_root, True, ""
 
 
@@ -160,7 +195,11 @@ def main() -> None:
                         help="Problem statement for RCA (passed through to state.json)")
     parser.add_argument("--job-dir", default=None,
                         help="Reuse an existing job dir (skips validation, updates state.json)")
+    parser.add_argument("--data-dir", default=_DEFAULT_DATA_DIR,
+                        help="Path to must-gather data (default: /data/input)")
     args = parser.parse_args()
+
+    data_input_dir = Path(args.data_dir)
 
     if args.job_dir:
         job_dir = Path(args.job_dir)
@@ -174,13 +213,13 @@ def main() -> None:
     mode = "must-gather"
 
     if args.job_dir:
-        cluster_dir, success, error_msg = _check_data_source()
+        cluster_dir, success, error_msg = _check_data_source(data_input_dir)
     else:
         _log_pod(f"Step 1/4 — extract_cluster  job_id={job_id}  mode=must-gather")
         print(f"[extract_cluster] job_id={job_id}  mode=must-gather", file=sys.stderr)
 
-        _log_pod("Step 1/4 — checking data source at /data/input (PVC mount)")
-        cluster_dir, success, error_msg = _check_data_source()
+        _log_pod(f"Step 1/4 — checking data source at {data_input_dir}")
+        cluster_dir, success, error_msg = _check_data_source(data_input_dir)
 
     state = {
         "job_id":      job_id,

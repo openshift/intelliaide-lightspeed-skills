@@ -2,9 +2,14 @@
 
 approvers:
   - Prashanth684
-  - dattaramba
+  - shivprakashmuley
+  - swghosh
+  - spatidar
+
 reviewers:
   - Prashanth684
-  - dattaramba
+  - shivprakashmuley
+  - swghosh
+  - spatidar
 
 component: "IntelliAide RCA Lightspeed Skills"

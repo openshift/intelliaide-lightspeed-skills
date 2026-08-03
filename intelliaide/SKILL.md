@@ -1,6 +1,6 @@
 ---
 name: intelliaide
-description: Deep troubleshooting and root cause analysis for OpenShift clusters using must-gather archives. Use when the user wants a thorough investigation, deep analysis, or RCA of any cluster issue and has a must-gather available.
+description: Deep troubleshooting and root cause analysis for OpenShift clusters using must-gather data. Use when the user wants a thorough investigation, deep analysis, or RCA of any cluster issue.
 ---
 
 # IntelliAide RCA Skills
@@ -46,10 +46,12 @@ oc annotate proposal "$_PROPOSAL" -n "$_NS" \
 
 Use these messages at each step:
 
-- Before Step 1: `"IntelliAide: validating must-gather data at /data/input (PVC)"`
+- Before Step 0: `"IntelliAide: loading must-gather via MCP"`
+- After Step 0:  `"IntelliAide: must-gather loaded — validating data"`
 - After Step 1:  `"IntelliAide: must-gather ready — preparing file selection"`
 - After Step 2a: `"IntelliAide: file selection prompt ready — selecting files"`
-- After Step 2b: `"IntelliAide: file selection complete (high=N, medium=N, low=N) — running ML analysis"`
+- After Step 2b: `"IntelliAide: file selection complete (high=N, medium=N, low=N) — fetching files via MCP"`
+- After Step 2c: `"IntelliAide: files cached locally — running ML analysis"`
 - After Step 3:  `"IntelliAide: ML analysis complete — preparing RCA chunks (high priority)"`
 - After Step 4a: `"IntelliAide: RCA chunks ready (N chunks) — analyzing"`
 - After Step 4b: `"IntelliAide: chunk analysis complete — batching for synthesis"`
@@ -66,15 +68,71 @@ If `oc annotate` fails, ignore it and continue — it is non-critical.
 Work through the steps below **in order**.  After each command, parse the JSON line printed to
 stdout and decide whether to continue.
 
-### Step 1 — Validate the pre-populated must-gather PVC
+### Step 0 — Load must-gather data via MCP server (MANDATORY — DO NOT SKIP)
+
+> **CRITICAL ARCHITECTURE NOTE:**
+> The must-gather data lives on a PVC mounted ONLY inside the MCP server pod.
+> The path `/data/<subpath>/<pod-name>` is a **REMOTE** path on the MCP server —
+> it does **NOT** exist in your local filesystem. You cannot `ls`, `cat`, or access
+> `/data/...` directly. All file access goes through MCP tool calls.
+>
+> For IntelliAide Python scripts, files are fetched into a **local cache** at
+> `/tmp/must-gather-cache` automatically as needed (see Step 3). NEVER pass `/data/...`
+> to `--data-dir`.
+
+If the Proposal request contains a `mustgather_use` instruction (e.g. `mustgather_use("/data/...")`),
+you **MUST** call it — even if the path looks like it could be local. It is not local.
 
 ```
-python /app/skills/intelliaide/extract_cluster.py --query "<problem statement>"
+mustgather_use(path="/data/<subpath>/<pod-name>")
 ```
 
-The script immediately validates the must-gather data mounted from the PVC at `/data/input`.
-The PVC must be pre-populated with diagnostic data before the Proposal is created — the operator
-mounts it read-only into the sandbox pod automatically. No manual `oc cp` is required.
+This tells the shared MCP server which collection to operate on. Without this call,
+no other `mustgather_*` MCP tool will work.
+
+`mustgather_use` returns the
+verification in its response (`Must-gather archive loaded successfully`, plus the
+version, timestamp, resource count, and namespace count). Treat any error result from
+this call as failure.
+
+If the response confirms the archive loaded successfully, proceed to Step 1.
+
+If no MCP server is available, or the Proposal does not specify a `mustgather_use` path,
+fall back to collecting must-gather data inside the sandbox:
+
+```bash
+oc adm must-gather --dest-dir=/tmp/must-gather-output
+```
+
+This collects diagnostic data from the cluster into `/tmp/must-gather-output`. The command
+may take 10-30 minutes depending on cluster size. Wait for it to complete before proceeding.
+
+If `oc adm must-gather` fails, **stop immediately** and report the error.
+
+### Step 1 — Validate the must-gather data
+
+> **REMINDER:** `/data/...` paths are on the MCP server, NOT your local filesystem.
+> You MUST use `/tmp/must-gather-cache` as `--data-dir` for all Python scripts.
+
+If data was loaded via MCP (Step 0), create the local cache directory. It is expected
+to start out empty — that is normal, not an error:
+
+```bash
+mkdir -p /tmp/must-gather-cache
+```
+
+`extract_cluster.py` (below) detects MCP mode automatically via the `MCP_SERVER_URL` /
+`LIGHTSPEED_MCP_SERVERS` environment variable and treats an empty cache directory as
+expected, skipping the local file-count validation used in non-MCP mode. Files are
+fetched on demand for only the files selected in Step 2b, as part of Step 3.
+
+Then run validation against the **local cache** (NOT the `/data/...` path):
+
+```
+python /app/skills/intelliaide/extract_cluster.py --query "<problem statement>" --data-dir /tmp/must-gather-cache
+```
+
+If data was collected locally in Step 0 (fallback), use `/tmp/must-gather-output` instead.
 
 Capture `job_dir` and `cluster_dir` from the output JSON.  If `success=false`, **stop
 immediately** — report the error message from the output and do not proceed to Step 2.
@@ -139,6 +197,27 @@ Rules:
 - Set `"found": true` for all entries (downstream analyze_data.py checks actual existence).
 - Aim for 5–20 high-priority files, fewer medium/low.
 
+#### Step 2c — Files are fetched automatically
+
+When the must-gather was loaded via MCP (Step 0), you do **not** fetch files yourself.
+`analyze_data.py` in Step 3 fetches every file listed in `file_selection.json` for the
+priority tier being analyzed, before it starts analysis — this happens automatically
+inside the script.
+
+For reference, `analyze_data.py` uses the `mcp_adapter` package internally, which maps
+each selected path to one of the real MCP tools:
+
+- Pod logs → `mustgather_pod_logs_get`
+- Resource YAMLs / lists → `mustgather_resources_list`
+- Events → `mustgather_events_list`
+- ETCD health / object count → `mustgather_etcd_health` / `mustgather_etcd_object_count`
+- Node diagnostics → `mustgather_node_diagnostics_get`
+
+Fetched content is written into the cache directory (`cluster_dir`, e.g.
+`/tmp/must-gather-cache`) and reused on later runs. Only the files selected in Step 2b
+are fetched — never the entire archive — and a failed fetch for one file does not block
+the others. Simply proceed to Step 3; no separate action is required here.
+
 ---
 
 ### Step 3 — Analyze data with ML (Python, no LLM)
@@ -148,6 +227,12 @@ Run for each priority tier that has files (high first, then medium/low only if n
 ```
 python /app/skills/intelliaide/analyze_data.py --job-dir <job_dir> --priority high
 ```
+
+When MCP mode is active, this is the step that actually fetches the Step 2b-selected
+files (see Step 2c) — `analyze_data.py` calls the MCP adapter itself before analyzing,
+writing fetched content into `cluster_dir`. Ensure `cluster_dir` in `file_selection.json`
+points to the cache location (`/tmp/must-gather-cache`); the script reads/fetches files
+relative to this directory.
 
 Capture `priority`, `yaml_files`, `log_files` from output.
 

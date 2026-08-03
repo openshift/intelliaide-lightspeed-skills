@@ -104,7 +104,19 @@ def _mode_chunks(args: argparse.Namespace) -> None:
 
     analysis_file = job_dir / f"analysis_{args.priority}.json"
     analysis      = json.loads(analysis_file.read_text())
-    yaml_errors   = analysis.get("yaml_errors", {})
+    # analyze_data.py writes yaml_errors as a wrapper:
+    #   {"output_flags": {...}, "files": {<path>: {"objects": [...], "summary": {...}}}}
+    # but prepare_payload_for_llm() (via prepare_rca_chunks) expects the flat
+    # per-file map itself ({<path>: {"objects": [...]}}). Passing the wrapper
+    # unchanged means every top-level key ("output_flags", "files") fails the
+    # {"objects": [...]} / list shape check inside prepare_payload_for_llm and
+    # gets silently skipped — so chunk_count is always 0, even when analyze_data.py
+    # found real Error/Majority Error/CONFIG objects.
+    yaml_errors_wrapper = analysis.get("yaml_errors", {}) or {}
+    if isinstance(yaml_errors_wrapper, dict) and "files" in yaml_errors_wrapper:
+        yaml_errors = yaml_errors_wrapper.get("files", {}) or {}
+    else:
+        yaml_errors = yaml_errors_wrapper
     log_entries   = analysis.get("log_entries", []) or None
 
     _log_pod(

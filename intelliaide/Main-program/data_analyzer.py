@@ -1865,8 +1865,15 @@ class DataAnalyzer:
         if yaml_files:
             # Process all YAML files (clusteroperators.yaml, clusterversions.yaml, etc.)
             for yaml_file in yaml_files:
-                file_key = os.path.basename(yaml_file)
                 original_path = path_mapping.get(yaml_file, yaml_file)
+                # Use the resolved relative path (not just the basename) as the
+                # dedup/aggregation key. Must-gather archives routinely have many
+                # same-named files (events.yaml, pods.yaml under every namespace/
+                # dir), so keying purely on basename silently drops every file but
+                # the last one processed when self.extracted_metadata[file_key] is
+                # written below — losing whatever errors/anomalies were found in
+                # all the earlier same-named files.
+                file_key = original_path or os.path.basename(yaml_file)
                 if progress_callback:
                     try:
                         progress_callback("yaml_processing", f"Sending to ML: {file_key}", {"file": file_key})

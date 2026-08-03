@@ -125,21 +125,25 @@ MUST-GATHER DOCUMENTATION:
 USER PROBLEM STATEMENT:
 {problem_statement}
 
-TASK: Suggest specific file paths from the must-gather collection.
+TASK: Suggest specific file paths from the must-gather collection, then write
+them directly to <job_dir>/file_selection.json (do NOT print the JSON to
+stdout — write the file).
 
-OUTPUT FORMAT — CRITICAL: Problem category line, then numbered list with [high]/[medium]/[low] priority tags.
-
-Problem category: <category>
-1. [high] path/to/file — reason
-2. [medium] path/to/file — reason
-3. [low] path/to/file — reason
+OUTPUT FORMAT — CRITICAL: file_selection.json must have exactly this schema:
+{{
+  "problem_category": "<category>",
+  "high":   [{{"original": "path/to/file", "resolved": "path/to/file", "found": false, "reason": "..."}}],
+  "medium": [{{"original": "path/to/file", "resolved": "path/to/file", "found": false, "reason": "..."}}],
+  "low":    [{{"original": "path/to/file", "resolved": "path/to/file", "found": false, "reason": "..."}}]
+}}
 
 Rules:
-- First line must be exactly "Problem category: <category>"
-- Each list line: number, period, space, [high] or [medium] or [low], space, path, then " — " and a short reason
-- Always include both current.log and previous.log for pod logs
-- Base suggestions on the must-gather structure documentation above
-- Output NOTHING else. No JSON. No markdown."""
+- Top-level keys are exactly "problem_category", "high", "medium", "low" — no other nesting.
+- Each entry in high/medium/low is an OBJECT (not a bare string) with "original", "resolved", "found", "reason".
+- Set "resolved" equal to "original" and "found" to false — downstream steps fetch/verify the file.
+- Always include both current.log and previous.log for pod logs.
+- Base suggestions on the must-gather structure documentation above.
+- Do not invent or pre-create placeholder files on disk to satisfy earlier steps — leave file fetching to the pipeline."""
 
 
 
@@ -179,11 +183,16 @@ def prepare_file_selection_prompt(problem_statement: str, docs_dir: str, job_dir
             "No must-gather structure documentation is available.\n\n"
             f"USER PROBLEM STATEMENT:\n{problem_statement.strip()}\n\n"
             "Suggest the most likely must-gather file paths for this problem using your knowledge "
-            "of standard OpenShift must-gather layout.\n\n"
-            "OUTPUT FORMAT:\nProblem category: <category>\n"
-            "1. [high] path/to/file — reason\n"
-            "2. [medium] path/to/file — reason\n"
-            "3. [low] path/to/file — reason"
+            "of standard OpenShift must-gather layout, then write them directly to "
+            "<job_dir>/file_selection.json (do NOT print the JSON to stdout).\n\n"
+            "OUTPUT FORMAT — file_selection.json must have exactly this schema:\n"
+            "{\n"
+            '  "problem_category": "<category>",\n'
+            '  "high":   [{"original": "path/to/file", "resolved": "path/to/file", "found": false, "reason": "..."}],\n'
+            '  "medium": [{"original": "path/to/file", "resolved": "path/to/file", "found": false, "reason": "..."}],\n'
+            '  "low":    [{"original": "path/to/file", "resolved": "path/to/file", "found": false, "reason": "..."}]\n'
+            "}\n\n"
+            "Always include both current.log and previous.log for pod logs."
         )
 
     prompt_path = Path(job_dir) / "file_selection_prompt.md"

@@ -107,6 +107,45 @@ def _build_log_entries(log_processing_result: dict) -> list:
     return entries
 
 
+def _files_exist_locally(file_paths: list, cluster_dir: str) -> bool:
+    """Check if at least half the selected files already exist on disk."""
+    if not file_paths:
+        return True
+    found = 0
+    for p in file_paths[:10]:
+        candidate = os.path.join(cluster_dir, p.strip().lstrip("/"))
+        if os.path.exists(candidate):
+            found += 1
+    return found >= max(1, len(file_paths[:10]) // 2)
+
+
+def _fetch_via_mcp(file_paths: list, cluster_dir: str) -> None:
+    """Fetch selected files from MCP server into local cache if needed."""
+    from mcp_adapter import MCPMustGatherAdapter
+    from mcp_adapter.mcp_client import get_mcp_url
+
+    mcp_url = get_mcp_url()
+    if not mcp_url:
+        return
+
+    if _files_exist_locally(file_paths, cluster_dir):
+        print("[analyze_data] Files already present locally — skipping MCP fetch.", file=sys.stderr)
+        return
+
+    print(f"[analyze_data] Fetching {len(file_paths)} files via MCP adapter...", file=sys.stderr)
+    adapter = MCPMustGatherAdapter(mcp_url=mcp_url, cache_dir=cluster_dir)
+    try:
+        report = adapter.fetch_batch(file_paths)
+        print(
+            f"[analyze_data] MCP fetch done: {len(report['fetched'])} fetched, "
+            f"{len(report['skipped_no_tool'])} skipped, "
+            f"{len(report['failed'])} failed",
+            file=sys.stderr,
+        )
+    finally:
+        adapter.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job-dir",  required=True)
@@ -148,6 +187,12 @@ def main() -> None:
             "analysis_path": analysis_path,
         }))
         return
+
+    # --- Fetch files via MCP if not already present locally ---
+    try:
+        _fetch_via_mcp(file_paths, cluster_dir)
+    except Exception as e:
+        print(f"[analyze_data] MCP fetch failed (continuing with local files): {e}", file=sys.stderr)
 
     _log_pod(f"Step 3/4 — analyze_data  priority={args.priority}  files={len(file_paths)}")
     print(
