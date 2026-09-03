@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+.eval-workspaces/
+
+# Personal/local dev scripts and IDE workspace files - not part of the skill
+deploy-vertex-e2e.sh
+setup-vertex-adc.sh
+*.code-workspace
